@@ -2,10 +2,14 @@ import sys
 from pathlib import Path
 from openpyxl import load_workbook
 import os
+import calendar
+from datetime import datetime
+
 
 def is_missing(v):
     """Check if a value is considered missing (None, empty, or '-')."""
     return v is None or (isinstance(v, str) and v.strip() in ("", "-"))
+
 
 def find_header_row_and_cols(ws, search_rows=20, max_cols=50):
     """
@@ -34,13 +38,19 @@ def find_header_row_and_cols(ws, search_rows=20, max_cols=50):
         if name_col and cin_col and cout_col:
             return r, name_col, cin_col, cout_col
 
-    raise RuntimeError("Could not find header row with Name / Check In Time / Check Out Time")
+    raise RuntimeError(
+        "Could not find header row with Name / Check In Time / Check Out Time"
+    )
 
-def process_ws(ws, progress_callback=None):
+
+def process_ws(ws, wb, progress_callback=None):
     # 1) Detect header and column indices
     header_row, name_col, cin_col, cout_col = find_header_row_and_cols(ws)
-    shift_col = 4  # Assuming Shift is the 4th column (1-based index) based on provided data
+    shift_col = (
+        4  # Assuming Shift is the 4th column (1-based index) based on provided data
+    )
     timetable_col = 5  # Assuming Timetable is the 5th column (1-based index)
+    date_col = 3  # Assuming Date is the 3rd column (1-based index)
 
     # 2) Iterate from last data row to first, marking rows for deletion
     first_data_row = header_row + 1
@@ -58,7 +68,7 @@ def process_ws(ws, progress_callback=None):
         timetable_val = ws.cell(r, timetable_col).value
 
         # Check if both check-in and check-out are missing and a shift is scheduled
-        if is_missing(cin_val) and is_missing(cout_val) and shift_val and timetable_val and "-" not in (shift_val, timetable_val):
+        if is_missing(cin_val) and is_missing(cout_val):
             rows_to_delete.append(r)
 
         r -= 1
@@ -67,22 +77,22 @@ def process_ws(ws, progress_callback=None):
             progress = int((processed_rows / total_rows) * 20)  # 20% for deletion phase
             progress_callback(progress)  # // grok show progress
 
-   # 3) Delete marked rows in batches for efficiency (group consecutive rows)
+    # 3) Delete marked rows in batches for efficiency (group consecutive rows)
     if rows_to_delete:
         rows_to_delete.sort()  # Sort ascending to group ranges
         batch_starts = [rows_to_delete[0]]
         batch_lengths = [1]
         for i in range(1, len(rows_to_delete)):
-            if rows_to_delete[i] == rows_to_delete[i-1] + 1:
+            if rows_to_delete[i] == rows_to_delete[i - 1] + 1:
                 batch_lengths[-1] += 1
             else:
                 batch_starts.append(rows_to_delete[i])
                 batch_lengths.append(1)
-        
+
         # Delete from bottom to top to avoid index shifts
         for start, length in zip(reversed(batch_starts), reversed(batch_lengths)):
             ws.delete_rows(start, length)
-        
+
         if progress_callback:
             progress = 20
             progress_callback(progress)  # // grok show progress
@@ -133,7 +143,11 @@ def process_ws(ws, progress_callback=None):
 
             # Search upward within the block for the closest previous value
             j = i - 1
-            while j >= start and ws.cell(j, name_col).value == name and (need_cin or need_cout):
+            while (
+                j >= start
+                and ws.cell(j, name_col).value == name
+                and (need_cin or need_cout)
+            ):
                 prev_cin = ws.cell(j, cin_col).value
                 prev_cout = ws.cell(j, cout_col).value
 
@@ -166,7 +180,11 @@ def process_ws(ws, progress_callback=None):
 
             # Search downward within the block for the closest next value
             j = i + 1
-            while j <= end and ws.cell(j, name_col).value == name and (need_cin or need_cout):
+            while (
+                j <= end
+                and ws.cell(j, name_col).value == name
+                and (need_cin or need_cout)
+            ):
                 next_cin = ws.cell(j, cin_col).value
                 next_cout = ws.cell(j, cout_col).value
 
@@ -181,12 +199,78 @@ def process_ws(ws, progress_callback=None):
                 j += 1
 
         if progress_callback:
-            progress = 20 + int((current_block / total_blocks) * 60)  # 60% for fill phases
+            progress = 20 + int(
+                (current_block / total_blocks) * 60
+            )  # 60% for fill phases
             progress_callback(progress)  # // grok show progress
 
     if progress_callback:
         progress = 80  # 80% after filling, leaving 20% for saving
         progress_callback(progress)  # // grok show progress
+
+    # 7) Calculate attendance summary
+    # Get the month and total days from the first data row's date
+    first_date = ws.cell(first_data_row, date_col).value
+    if isinstance(first_date, datetime):
+        month = first_date.month
+        year = first_date.year
+        total_days = calendar.monthrange(year, month)[1]
+    else:
+        try:
+            # Attempt to parse string date in YYYY-MM-DD format
+            first_date = datetime.strptime(str(first_date), "%Y-%m-%d")
+            month = first_date.month
+            year = first_date.year
+            total_days = calendar.monthrange(year, month)[1]
+        except (ValueError, TypeError):
+            raise ValueError("Invalid date format in the first data row")
+
+    # Initialize attendance dictionary
+    attendance = {}
+    r = first_data_row
+    while r <= ws.max_row:
+        name = ws.cell(r, name_col).value
+        cin_val = ws.cell(r, cin_col).value
+        cout_val = ws.cell(r, cout_col).value
+
+        # Check if employee has any unconfirmed status (valid check-in but no valid check-out)
+        if name not in attendance:
+            attendance[name] = {"dates": set(), "unconfirmed": False}
+        if not is_missing(cin_val) and is_missing(cout_val):
+            attendance[name]["unconfirmed"] = True
+
+        # Add unique date to the set if at least one time is valid
+        date_val = ws.cell(r, date_col).value
+        if isinstance(date_val, datetime) or (
+            isinstance(date_val, str) and "-" in date_val
+        ):
+            if isinstance(date_val, str):
+                try:
+                    date_val = datetime.strptime(date_val, "%Y-%m-%d")
+                except ValueError:
+                    date_val = None
+            if date_val and (not is_missing(cin_val) or not is_missing(cout_val)):
+                attendance[name]["dates"].add(date_val.date())
+
+        r += 1
+
+    # 8) Create a new sheet for attendance summary
+    summary_ws = wb.create_sheet("Attendance Summary")
+    summary_ws.append(["Name", "Present", "Absent"])  # Header row
+
+    # 9) Populate attendance summary
+    for name, data in attendance.items():
+        if data["unconfirmed"]:
+            summary_ws.append([name, "Not Confirmed", "Not Confirmed"])
+        else:
+            present = len(data["dates"])
+            absent = total_days - present
+            summary_ws.append([name, present, absent])
+
+    if progress_callback:
+        progress = 100  # 100% after summary creation
+        progress_callback(progress)  # // grok show progress
+
 
 def process_excel(file, progress_callback=None):
     """
@@ -200,8 +284,9 @@ def process_excel(file, progress_callback=None):
 
     wb = load_workbook(file, keep_vba=keep_vba)
     ws = wb.worksheets[0]  # first sheet only
-    process_ws(ws, progress_callback)
+    process_ws(ws, wb, progress_callback)
     return wb
+
 
 def main():
     if len(sys.argv) < 2:
@@ -229,6 +314,7 @@ def main():
 
     wb.save(out)
     print(f"Done. Wrote: {out}")
+
 
 if __name__ == "__main__":
     main()
